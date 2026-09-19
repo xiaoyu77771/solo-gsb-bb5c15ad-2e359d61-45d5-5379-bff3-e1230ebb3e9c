@@ -2,8 +2,9 @@
 
 FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校验和），按地址组装固件映像，
 返回合并后的连续 Base64 段、段间空洞、入口地址与逐行诊断；并可针对一组命名内存区域
-做布局校验（覆盖率、data/entry 权限、区域占用率）、规划整体重定位，或对比当前/目标两个
-映像规划 NOR Flash 的差分擦除/写入操作。
+做布局校验（覆盖率、data/entry 权限、区域占用率）、规划整体重定位，对比当前/目标两个
+映像规划 NOR Flash 的差分擦除/写入操作，或按 Cortex-M 向量表语义校验映像中的向量表
+（初始栈顶、复位向量、Thumb 位与 ram/executable 区域归属）。
 
 ## 快速启动（单条命令）
 
@@ -327,6 +328,83 @@ curl -s -X POST http://localhost:8000/api/v1/plan-flash-update \
   `write_count`/`write_bytes`（实际携带的写字节总量）、
   `changed_bytes` 与 `zero_to_one_bytes`。
 
+### `POST /api/v1/validate-vector-table`
+
+Cortex-M 向量表校验：复用 Intel HEX 解析器组装映像，从 `vector_table_start` 起按
+**小端 32 位**读取 `vector_count` 个向量（至少 2 个：初始栈顶 + 复位向量），并结合
+带 `ram`/`executable` 属性的内存区域逐条校验。任一前置条件无效时不读表。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/validate-vector-table \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hex_text": ":020000040800F2\n:1000000000000220010100080000000001020008B9\n:00000001FF\n",
+    "vector_table_start": 134217728,
+    "vector_count": 4,
+    "regions": [
+      {"name": "flash", "start": 134217728, "end": 134479872, "ram": false, "executable": true},
+      {"name": "ram",   "start": 536870912, "end": 537001984, "ram": true,  "executable": false}
+    ]
+  }' | jq
+```
+
+判定规则：
+
+- HEX 无效时只返回 `diagnostics`（`vectors`/`violations` 为空、`regions_valid` 为
+  `null`），不执行向量表校验。
+- 区域定义校验与布局接口一致：每个区域须满足 `start < end` 且互不重叠；不合法时
+  `regions_valid=false`，`violations` 给出 `invalid_region`/`region_overlap`，不读表。
+- 逐条读取向量（条目地址 = `vector_table_start + 4 * index`）：
+  - 任一字节缺失 → `missing_vector_bytes`，违规与条目均定位条目序号 `index` 与
+    缺失字节地址（条目 `missing_bytes` 列出全部缺失地址），该条目 `status=error`、
+    `value=null`；
+  - 条目 0（`initial_sp`）：栈顶必须 8 字节对齐（否则 `stack_misaligned`）且落在
+    某个 `ram=true` 区域内，**允许等于 RAM 末端**（否则 `stack_outside_ram`）；
+  - 条目 1（`reset`）：必须非零（否则 `reset_vector_zero`）；
+  - 条目 2+（`handler`）：零向量视为空槽，`status=empty`，不再检查；
+  - 所有非零处理器地址（条目 1 起）：必须带 Thumb 位（bit 0，否则
+    `thumb_bit_missing`），且清除最低位后的地址须落在某个 `executable=true` 区域内
+    （否则 `address_not_executable`）。
+
+上例响应（同样恒为 200；栈顶 `0x20020000` 恰为 RAM 末端，合法）：
+
+```json
+{
+  "ok": true,
+  "hex_ok": true,
+  "regions_valid": true,
+  "error_count": 0,
+  "warning_count": 0,
+  "entry_address": null,
+  "total_bytes": 16,
+  "vector_table_start": 134217728,
+  "vector_count": 4,
+  "vectors": [
+    {"index": 0, "address": 134217728, "role": "initial_sp", "status": "ok",
+     "value": 537001984, "target_address": null, "missing_bytes": [],
+     "message": "initial SP 0x20020000 inside RAM region 'ram'"},
+    {"index": 1, "address": 134217732, "role": "reset", "status": "ok",
+     "value": 134217985, "target_address": 134217984, "missing_bytes": [],
+     "message": "reset -> 0x08000100 in executable region 'flash'"},
+    {"index": 2, "address": 134217736, "role": "handler", "status": "empty",
+     "value": 0, "target_address": null, "missing_bytes": [],
+     "message": "empty slot (zero vector)"},
+    {"index": 3, "address": 134217740, "role": "handler", "status": "ok",
+     "value": 134218241, "target_address": 134218240, "missing_bytes": [],
+     "message": "handler -> 0x08000200 in executable region 'flash'"}
+  ],
+  "violations": [],
+  "diagnostics": [ ... ]
+}
+```
+
+- `vectors[]`：逐条结果，`role` 为 `initial_sp`/`reset`/`handler`，`status` 为
+  `ok`/`empty`/`error`；`value` 为解析出的小端 32 位字（字节缺失时为 `null`），
+  `target_address` 为非零处理器地址清除 Thumb 位后的目标地址。
+- `violations[]`：汇总全部违规（区域定义问题 + 逐条向量问题），每条给出 `kind`、
+  关联条目 `index`、相关地址 `address` 与区域 `region`（适用时）。
+- `ok` 仅在 HEX 有效、区域定义合法且无任何向量违规时为 `true`。
+
 ## 解析规则
 
 - 每行必须形如 `:llaaaatt<data>cc`；校验 `ll`（字节数）与实际数据长度一致，
@@ -351,11 +429,13 @@ app/
   layout.py       # 内存布局校验（区域定义检查、段切分、占用统计，纯逻辑）
   relocation.py   # 整体重定位规划（可行 delta 闭区间求交合并、选最小位移，纯逻辑）
   flash_update.py # Flash 差分烧写规划（逐块比较、擦除判定、run 合并与切分，纯逻辑）
+  vector_table.py # Cortex-M 向量表校验（小端读取、栈顶/复位/Thumb 位与区域归属，纯逻辑）
 tests/
-  test_hex_service.py         # 解析器与 assemble 接口
-  test_validate_layout.py     # validate-layout 接口与布局逻辑
-  test_plan_relocation.py     # plan-relocation 接口与重定位逻辑
-  test_plan_flash_update.py   # plan-flash-update 接口与烧写规划逻辑
+  test_hex_service.py           # 解析器与 assemble 接口
+  test_validate_layout.py       # validate-layout 接口与布局逻辑
+  test_plan_relocation.py       # plan-relocation 接口与重定位逻辑
+  test_plan_flash_update.py     # plan-flash-update 接口与烧写规划逻辑
+  test_validate_vector_table.py # validate-vector-table 接口与向量表校验逻辑
 Dockerfile
 docker-compose.yml
 requirements.txt       # 运行依赖
