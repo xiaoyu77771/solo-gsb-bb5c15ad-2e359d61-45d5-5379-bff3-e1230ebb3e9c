@@ -12,6 +12,7 @@ from .hex_parser import ParseResult, parse_intel_hex
 from .layout import Region, validate_layout
 from .relocation import plan_relocation
 from .flash_update import plan_flash_update
+from .vector_table import VectorRegion, validate_vector_table
 
 app = FastAPI(
     title="Firmware Image Assembly Service",
@@ -24,8 +25,10 @@ app = FastAPI(
         "The assembled image can also be validated against a set of named, "
         "non-overlapping memory regions (data/entry permissions, per-region "
         "occupancy and utilization), relocated as a whole by one integer "
-        "delta whose feasible range is computed against those regions, or "
-        "diffed against another image to plan NOR-flash erase/write steps."
+        "delta whose feasible range is computed against those regions, "
+        "diffed against another image to plan NOR-flash erase/write steps, "
+        "or checked as a Cortex-M vector table (stack pointer in RAM, "
+        "Thumb-bit handlers inside executable regions)."
     ),
 )
 
@@ -251,6 +254,105 @@ class ValidateLayoutResponse(BaseModel):
     diagnostics: list[DiagnosticOut]
 
 
+class VectorRegionIn(BaseModel):
+    name: str = Field(..., min_length=1, description="Region label")
+    start: int = Field(..., ge=0, description="Inclusive start address")
+    end: int = Field(..., ge=0, description="Exclusive end address (half-open interval)")
+    ram: bool = Field(False, description="Whether the region is RAM (may hold the stack pointer)")
+    executable: bool = Field(
+        False, description="Whether handler targets (Thumb bit cleared) may land in the region"
+    )
+
+
+class ValidateVectorTableRequest(BaseModel):
+    hex_text: str = Field(..., description="Intel HEX text, one record per line")
+    table_start: int = Field(
+        ..., ge=0, description="Address of the first vector table entry (initial stack pointer)"
+    )
+    vector_count: int = Field(
+        ..., ge=1, description="Number of 32-bit vector entries to inspect, starting at table_start"
+    )
+    regions: list[VectorRegionIn] = Field(
+        ..., description="Memory regions with ram/executable attributes; non-empty, non-overlapping"
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "hex_text": (
+                        ":020000040800F2\n"
+                        ":1000000000100020090000080D000008000000009A\n"
+                        ":00000001FF\n"
+                    ),
+                    "table_start": 134217728,
+                    "vector_count": 4,
+                    "regions": [
+                        {"name": "sram", "start": 536870912, "end": 536936448, "ram": True},
+                        {
+                            "name": "flash",
+                            "start": 134217728,
+                            "end": 134479872,
+                            "executable": True,
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+
+
+class VectorViolationOut(BaseModel):
+    kind: str = Field(
+        ...,
+        description=(
+            "incomplete_vector | stack_misaligned | stack_not_in_ram | "
+            "reset_is_zero | missing_thumb_bit | handler_not_executable | "
+            "invalid_region | region_overlap"
+        ),
+    )
+    message: str
+    entry: int | None = Field(None, description="Vector table entry index, when applicable")
+    address: int | None = Field(None, description="Entry address, when applicable")
+    missing_ranges: list[tuple[int, int]] = Field(
+        default_factory=list,
+        description="Half-open ranges of missing bytes for incomplete_vector",
+    )
+    region: str | None = Field(None, description="Region the violation is tied to, if any")
+
+
+class VectorEntryOut(BaseModel):
+    index: int = Field(..., description="0-based vector table entry index")
+    address: int = Field(..., description="Address of the entry in the image")
+    status: str = Field(..., description="ok | empty | error")
+    role: str = Field(..., description="stack | reset | handler")
+    value: int | None = Field(None, description="Little-endian parsed word; null when incomplete")
+    complete: bool = Field(..., description="True when all four bytes are present")
+    missing_ranges: list[tuple[int, int]] = Field(
+        ..., description="Half-open ranges of bytes absent from the image"
+    )
+    violations: list[VectorViolationOut]
+
+
+class ValidateVectorTableResponse(BaseModel):
+    ok: bool = Field(..., description="True when the HEX/regions are valid and no entry violates")
+    hex_ok: bool = Field(..., description="True when the Intel HEX text passed validation")
+    regions_valid: bool | None = Field(
+        ...,
+        description="True when region definitions are non-empty and non-overlapping; "
+        "null when the check did not run (invalid HEX)",
+    )
+    error_count: int
+    warning_count: int
+    entry_address: int | None = Field(None, description="From the last 03/05 record, if present")
+    total_bytes: int
+    table_start: int
+    vector_count: int
+    entries: list[VectorEntryOut] = Field(..., description="Per-entry status and parsed value")
+    violations: list[VectorViolationOut] = Field(..., description="Every violation, summarized")
+    diagnostics: list[DiagnosticOut]
+
+
 class PlanFlashUpdateRequest(BaseModel):
     current_hex: str = Field(..., description="Intel HEX text of the image currently in flash")
     target_hex: str = Field(..., description="Intel HEX text of the image to reach")
@@ -457,6 +559,96 @@ def validate_layout_route(request: ValidateLayoutRequest) -> ValidateLayoutRespo
         ],
         violations=[ViolationOut(**vars(v)) for v in layout.violations],
         **parse_fields,
+    )
+
+
+@app.post(
+    "/api/v1/validate-vector-table",
+    response_model=ValidateVectorTableResponse,
+    tags=["layout"],
+)
+def validate_vector_table_route(request: ValidateVectorTableRequest) -> ValidateVectorTableResponse:
+    """Validate a Cortex-M vector table embedded in an Intel HEX image.
+
+    The HEX is parsed with the shared validator and the region
+    definitions checked as for ``/api/v1/validate-layout``; when either
+    fails only the corresponding diagnostics/violations are returned and
+    no entry is inspected. Otherwise ``vector_count`` little-endian
+    32-bit words are read starting at ``table_start``: missing bytes are
+    located per entry, entry 0 must be an 8-byte-aligned stack pointer
+    inside a ``ram`` region (the RAM end is inclusive), the reset vector
+    must be non-zero, later zero words are empty slots, and every
+    non-zero handler must carry the Thumb bit with the bit-cleared
+    target inside an ``executable`` region.
+    """
+    parsed = parse_intel_hex(request.hex_text)
+    diagnostics = [DiagnosticOut(**vars(d)) for d in parsed.diagnostics]
+    parse_fields = dict(
+        error_count=parsed.error_count,
+        warning_count=parsed.warning_count,
+        entry_address=parsed.entry_address,
+        total_bytes=parsed.total_bytes,
+        diagnostics=diagnostics,
+    )
+    if not parsed.ok:
+        return ValidateVectorTableResponse(
+            ok=False,
+            hex_ok=False,
+            regions_valid=None,
+            table_start=request.table_start,
+            vector_count=request.vector_count,
+            entries=[],
+            violations=[],
+            **parse_fields,
+        )
+
+    result = validate_vector_table(
+        parsed.segments,
+        request.table_start,
+        request.vector_count,
+        [
+            VectorRegion(
+                name=r.name,
+                start=r.start,
+                end=r.end,
+                ram=r.ram,
+                executable=r.executable,
+            )
+            for r in request.regions
+        ],
+    )
+    return ValidateVectorTableResponse(
+        ok=result.ok,
+        hex_ok=True,
+        regions_valid=result.regions_valid,
+        table_start=result.table_address,
+        vector_count=result.vector_count,
+        entries=[
+            VectorEntryOut(
+                index=e.index,
+                address=e.address,
+                status=e.status,
+                role=e.role,
+                value=e.value,
+                complete=e.complete,
+                missing_ranges=e.missing_ranges,
+                violations=[_vector_violation_out(v) for v in e.violations],
+            )
+            for e in result.entries
+        ],
+        violations=[_vector_violation_out(v) for v in result.violations],
+        **parse_fields,
+    )
+
+
+def _vector_violation_out(v) -> VectorViolationOut:
+    return VectorViolationOut(
+        kind=v.kind,
+        message=v.message,
+        entry=v.entry,
+        address=v.address,
+        missing_ranges=v.missing_ranges,
+        region=v.region,
     )
 
 

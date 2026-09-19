@@ -2,8 +2,9 @@
 
 FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校验和），按地址组装固件映像，
 返回合并后的连续 Base64 段、段间空洞、入口地址与逐行诊断；并可针对一组命名内存区域
-做布局校验（覆盖率、data/entry 权限、区域占用率）、规划整体重定位，或对比当前/目标两个
-映像规划 NOR Flash 的差分擦除/写入操作。
+做布局校验（覆盖率、data/entry 权限、区域占用率）、规划整体重定位，对比当前/目标两个
+映像规划 NOR Flash 的差分擦除/写入操作，或校验映像中的 **Cortex-M 向量表**
+（栈顶位于 RAM、Thumb 位处理器位于可执行区域）。
 
 ## 快速启动（单条命令）
 
@@ -141,6 +142,88 @@ curl -s -X POST http://localhost:8000/api/v1/validate-layout \
 - 每个区域汇总 `occupied_bytes`（落入的固件字节数）、`utilization`
   （`occupied_bytes / size`）及该区域关联的 `violations`；顶层 `violations`
   汇总全部违规。`ok` 仅在 HEX 有效且无任何违规时为 `true`。
+
+### `POST /api/v1/validate-vector-table`
+
+Cortex-M 向量表校验：复用同一 Intel HEX 解析器，请求体给出 `table_start`
+（向量表起始地址）、`vector_count`（32 位向量条数）以及带 `ram` /
+`executable` 属性的内存区域。HEX 或区域定义无效时**不做任何向量判定**
+（与 validate-layout 一致：先解析 HEX，再校验区域定义）。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/validate-vector-table \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "hex_text": ":020000040800F2\n:1000000000100020090000080D000008000000009A\n:00000001FF\n",
+    "table_start": 134217728,
+    "vector_count": 4,
+    "regions": [
+      {"name": "sram",  "start": 536870912, "end": 536936448, "ram": true,  "executable": false},
+      {"name": "flash", "start": 134217728, "end": 134479872, "ram": false, "executable": true}
+    ]
+  }' | jq
+```
+
+上例小端解析结果：entry 0 = `0x20008000`（栈顶，恰为 SRAM 末端）、
+entry 1 = `0x08000009`（复位向量，带 Thumb 位）、entry 2 = `0x0800000D`
+（中断处理器，带 Thumb 位）、entry 3 = `0x00000000`（空槽）。
+
+判定规则：
+
+- 自 `table_start` 起按**小端 32 位**逐条读取 `vector_count` 个向量；
+  条目中**任一字节缺失**即判 `incomplete_vector`，响应定位到条目序号
+  `entry`、条目地址 `address`，并以半开区间给出缺失字节 `missing_ranges`，
+  该条不再解释（`value=null`）。
+- entry 0（初始 MSP 栈顶）：必须 **8 字节对齐**（`value % 8 == 0`，否则
+  `stack_misaligned`），且必须落在某个 `ram=true` 区域内
+  （`stack_not_in_ram`）；RAM 末端按**闭区间**处理，**栈顶允许恰好等于
+  区域 `end`**，再大 1 即越界。
+- entry 1（复位向量）：必须非零，否则 `reset_is_zero`。
+- entry 2 及之后：零向量视为**空槽**（状态 `empty`，不违规）。
+- 所有非零处理器地址（含复位向量）：**必须带 Thumb 位**（最低位为 1，
+  否则 `missing_thumb_bit`）；**清除最低位后的地址必须落入某个
+  `executable=true` 区域**（半开区间，否则 `handler_not_executable`）。
+  两项检查相互独立，可同时上报；栈顶不做 Thumb 位检查。
+- 区域定义规则同 validate-layout：`start < end`、区域互不重叠
+  （相接允许），违规为 `invalid_region` / `region_overlap`，此时
+  `regions_valid=false` 且不检查任何条目。
+
+响应（恒为 200）在通用的 `hex_ok` / `regions_valid` / `error_count` /
+`diagnostics` 等字段之外，给出逐条状态与汇总违规：
+
+```json
+{
+  "ok": true,
+  "hex_ok": true,
+  "regions_valid": true,
+  "error_count": 0,
+  "warning_count": 0,
+  "entry_address": null,
+  "total_bytes": 16,
+  "table_start": 134217728,
+  "vector_count": 4,
+  "entries": [
+    {"index": 0, "address": 134217728, "status": "ok", "role": "stack",
+     "value": 536903680, "complete": true, "missing_ranges": [], "violations": []},
+    {"index": 1, "address": 134217732, "status": "ok", "role": "reset",
+     "value": 134217737, "complete": true, "missing_ranges": [], "violations": []},
+    {"index": 2, "address": 134217736, "status": "ok", "role": "handler",
+     "value": 134217741, "complete": true, "missing_ranges": [], "violations": []},
+    {"index": 3, "address": 134217740, "status": "empty", "role": "handler",
+     "value": 0, "complete": true, "missing_ranges": [], "violations": []}
+  ],
+  "violations": [],
+  "diagnostics": [ ... ]
+}
+```
+
+- `entries[]`：`index` 为条目序号（0 起），`address` 为条目所在地址，
+  `role` 为 `stack`/`reset`/`handler`，`status` 为 `ok`/`empty`/`error`，
+  `value` 为小端解析出的字（字节不全时为 `null`），`complete` 与
+  `missing_ranges` 描述 4 个字节是否齐备；每条内嵌其自身的 `violations`。
+- 顶层 `violations` 汇总全部条目违规；`ok` 仅在 HEX、区域定义均有效且
+  无任何条目违规时为 `true`。HEX 无效时 `hex_ok=false`、
+  `regions_valid=null`、`entries`/`violations` 为空。
 
 ### `POST /api/v1/plan-relocation`
 
@@ -351,9 +434,11 @@ app/
   layout.py       # 内存布局校验（区域定义检查、段切分、占用统计，纯逻辑）
   relocation.py   # 整体重定位规划（可行 delta 闭区间求交合并、选最小位移，纯逻辑）
   flash_update.py # Flash 差分烧写规划（逐块比较、擦除判定、run 合并与切分，纯逻辑）
+  vector_table.py # Cortex-M 向量表校验（小端读向量、栈顶/Thumb 位判定，纯逻辑）
 tests/
   test_hex_service.py         # 解析器与 assemble 接口
   test_validate_layout.py     # validate-layout 接口与布局逻辑
+  test_validate_vector_table.py # validate-vector-table 接口与向量表逻辑
   test_plan_relocation.py     # plan-relocation 接口与重定位逻辑
   test_plan_flash_update.py   # plan-flash-update 接口与烧写规划逻辑
 Dockerfile
